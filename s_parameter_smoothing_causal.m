@@ -252,7 +252,7 @@ function [Z_extrap, type] = extrapolate_Z_physical(f_curr, f_ref, Z_ref, Z0)
     X_ref = imag(Z_ref);
     
     % 判断元素类型
-    if abs(X_ref) < 1e-9 * (abs(R_dc) + 1e-12)
+    if abs(X_ref) < 1e-9 * (abs(R_ref) + 1e-12)
         type = 'resistive';
         R_curr = R_ref;
         X_curr = 0;
