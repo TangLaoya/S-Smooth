@@ -80,7 +80,7 @@ for i = 1:Nport
         has_jump_out = any(diff_out_dB > 2.0);
         
         if has_jump_out || (i == 1 && j == 1)  % 只输出前几个或有跳变的
-            fprintf('Z(%d,%d): 输入[%.3f, %.3f]dB → 输出[%.3f, %.3f]dB (max jump)\n', ...
+            fprintf('Z(%d,%d): 输入[%.3f, %.3f]dB → 输出[%.3f, %.3f]dB (max, mean jump)\n', ...
                 i, j, max_jump_in, mean_jump_in, max_jump_out, mean_jump_out);
         end
         
@@ -89,8 +89,10 @@ for i = 1:Nport
             jump_info = [jump_info; i, j, max_jump_out, mean_jump_out];
         end
         
-        improvement = (max_jump_in - max_jump_out) / max_jump_in * 100;
-        smooth_improvement = [smooth_improvement; improvement];
+        if max_jump_in > 0.1
+            improvement = (max_jump_in - max_jump_out) / max_jump_in * 100;
+            smooth_improvement = [smooth_improvement; improvement];
+        end
     end
 end
 
@@ -102,7 +104,9 @@ else
 end
 
 % 平均改善
-fprintf('平均改善率: %.2f%%\n\n', mean(smooth_improvement(smooth_improvement > 0)));
+if ~isempty(smooth_improvement)
+    fprintf('平均改善率: %.2f%%\n\n', mean(smooth_improvement(smooth_improvement > 0)));
+end
 
 % 5. 对数坐标下的线性拟合检验
 fprintf('========== 对数坐标线性拟合检验 ==========\n');
@@ -129,7 +133,9 @@ for i = 1:min(Nport, 3)  % 只检查前3个端口对
     end
 end
 
-fprintf('平均线性度误差: %.4f dB\n\n', mean(linearity_error));
+if ~isempty(linearity_error)
+    fprintf('平均线性度误差: %.4f dB\n\n', mean(linearity_error));
+end
 
 % 6. 绘图
 fprintf('========== 生成诊断图表 ==========\n');
@@ -148,39 +154,41 @@ else
     end
 end
 
-fig = figure('NumberTitle', 'off', 'Name', 'Z-Parameter平滑性诊断');
-n_plots = size(plot_idx, 1);
-
-for p = 1:n_plots
-    i = plot_idx(p, 1);
-    j = plot_idx(p, 2);
+if ~isempty(plot_idx)
+    fig = figure('NumberTitle', 'off', 'Name', 'Z-Parameter平滑性诊断');
+    n_plots = size(plot_idx, 1);
     
-    Z_curve_in = squeeze(Z_in(low_freq_idx, i, j));
-    Z_curve_out = squeeze(Z_out(low_freq_idx, i, j));
+    for p = 1:n_plots
+        i = plot_idx(p, 1);
+        j = plot_idx(p, 2);
+        
+        Z_curve_in = squeeze(Z_in(low_freq_idx, i, j));
+        Z_curve_out = squeeze(Z_out(low_freq_idx, i, j));
+        
+        amp_in = abs(Z_curve_in);
+        amp_out = abs(Z_curve_out);
+        
+        amp_in(amp_in < 1e-30) = 1e-30;
+        amp_out(amp_out < 1e-30) = 1e-30;
+        
+        dB_in = 20*log10(amp_in);
+        dB_out = 20*log10(amp_out);
+        
+        subplot(n_plots, 1, p);
+        loglog(freq_low, amp_in, 'o-', 'LineWidth', 1.5, 'MarkerSize', 4, 'DisplayName', 'Input');
+        hold on;
+        loglog(freq_low, amp_out, 's-', 'LineWidth', 1.5, 'MarkerSize', 4, 'DisplayName', 'Output');
+        grid on;
+        xlabel('Frequency (Hz)');
+        ylabel('|Z| (Ω)');
+        title(sprintf('Z(%d,%d) - Low Frequency Segment', i, j));
+        legend('Location', 'best');
+        hold off;
+    end
     
-    amp_in = abs(Z_curve_in);
-    amp_out = abs(Z_curve_out);
-    
-    amp_in(amp_in < 1e-30) = 1e-30;
-    amp_out(amp_out < 1e-30) = 1e-30;
-    
-    dB_in = 20*log10(amp_in);
-    dB_out = 20*log10(amp_out);
-    
-    subplot(n_plots, 1, p);
-    loglog(freq_low, amp_in, 'o-', 'LineWidth', 1.5, 'MarkerSize', 4, 'DisplayName', 'Input');
-    hold on;
-    loglog(freq_low, amp_out, 's-', 'LineWidth', 1.5, 'MarkerSize', 4, 'DisplayName', 'Output');
-    grid on;
-    xlabel('Frequency (Hz)');
-    ylabel('|Z| (Ω)');
-    title(sprintf('Z(%d,%d) - Low Frequency Segment', i, j));
-    legend('Location', 'best');
-    hold off;
+    savefig(fig, 'smoothing_diagnostics.fig');
+    fprintf('诊断图已保存为: smoothing_diagnostics.fig\n');
 end
-
-savefig(fig, 'smoothing_diagnostics.fig');
-fprintf('诊断图已保存为: smoothing_diagnostics.fig\n');
 
 % 7. 输出建议
 fprintf('\n========== 诊断建议 ==========\n');
