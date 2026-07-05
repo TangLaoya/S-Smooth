@@ -1,5 +1,6 @@
 function s_parameter_smoothing_causal
 % Z域实部/虚部物理外推替换 + 无源性强制（SVD缩放）
+% 改进版：Z→S转换严格约束 + 数值稳定性优化 + 对数频率插值
 
 n = 26;
 snp = ['s' num2str(n) 'p'];
@@ -17,14 +18,13 @@ fprintf('读取成功：端口数=%d，实际频点数=%d\n', Nport, Nf);
 S(isnan(S)) = 1e-15 + 1i*1e-15;
 S(isinf(S)) = 1e10 + 1i*1e10;
 
-% 3. 转换为Z（加正则化）
+% 3. 转换为Z（数值稳定版）
 Z0 = 50;
-I_mat = eye(Nport); % 定义单位矩阵
+I_mat = eye(Nport);
 Z = zeros(Nf, Nport, Nport);
 for k = 1:Nf
     Sk = squeeze(S(k,:,:));
-    Zk = Z0 * (I_mat + Sk) / (I_mat - Sk + 1e-12*I_mat);
-    Z(k,:,:) = Zk;
+    Z(k,:,:) = S_to_Z_stable(Sk, Z0, I_mat);
 end
 
 % 4. 探测全局平滑频段起点 M_opt
@@ -71,57 +71,93 @@ for i = 1:Nport
 end
 fprintf('检测到 %d 个低频跳变端口对\n', sum(jumpMask(:)));
 
-% 6. 对跳变端口对进行实部/虚部物理外推替换
+% ===== 新的外推与插值逻辑 =====
+
+% 6. 改进的外推：同时处理整个矩阵，保证S基本不变
+fprintf('\n========== 改进的Z矩阵外推（S约束）==========\n');
 Z_corrected = Z;
-for i = 1:Nport
-    for j = 1:Nport
-        if jumpMask(i,j)
-            Zc = squeeze(Z(:,i,j));
-            
-            % 锚点：平滑段起始点
-            f_ref = freq(M_opt);
-            Z_ref = Zc(M_opt);
-            R_dc = real(Z_ref);
-            X_ref = imag(Z_ref);
-            
-            Z_new_low = zeros(M_opt-1, 1);
-            for k = 1:M_opt-1
-                f_curr = freq(k);
+S_low_corrected = zeros(M_opt-1, Nport, Nport);
+
+for k_low = 1:(M_opt-1)
+    f_curr = freq(k_low);
+    f_ref = freq(M_opt);
+    
+    for i = 1:Nport
+        for j = 1:Nport
+            if jumpMask(i,j)
+                % 获取参考频点（平滑段起始）的Z和S
+                Z_ref = squeeze(Z(M_opt, i, j));
+                S_original = S(k_low, i, j);
                 
-                % 实部外推：低频趋于直流电阻常数
-                R_curr = R_dc;
+                % 第一阶段：基于物理规律的Z外推
+                [Z_extrap_init, extrap_type] = extrapolate_Z_physical(f_curr, f_ref, Z_ref, Z0);
                 
-                % 虚部外推：基于物理规律
-                if abs(X_ref) < 1e-9 * (abs(R_dc) + 1e-12)
-                    % 纯电阻
-                    X_curr = 0;
-                elseif X_ref < 0
-                    % 容性：X = -1/(2*pi*f*C)，与频率成反比，低频趋于 -Inf
-                    X_curr = X_ref * (f_ref / f_curr);
+                % 第二阶段：检查S变化，若过大则调整R
+                S_extrap_init = Z_to_S_element(Z_extrap_init, Z0);
+                S_delta = abs(S_extrap_init - S_original);
+                
+                if S_delta > 0.05 && abs(S_original) > 0.01  % S变化超过阈值
+                    % 调用约束优化：最小化S变化，同时保持X的物理特性
+                    Z_extrap = constrained_Z_adjustment(Z_extrap_init, S_original, Z0, ...
+                                                         f_curr, f_ref, extrap_type);
                 else
-                    % 感性：X = 2*pi*f*L，与频率成正比，低频趋于 0
-                    X_curr = X_ref * (f_curr / f_ref);
+                    Z_extrap = Z_extrap_init;
                 end
                 
-                Z_new_low(k) = R_curr + 1i * X_curr;
+                S_low_corrected(k_low, i, j) = Z_to_S_element(Z_extrap, Z0);
+                Z_corrected(k_low, i, j) = Z_extrap;
+            else
+                % 非跳变元素保持原样
+                S_low_corrected(k_low, i, j) = S(k_low, i, j);
+                Z_corrected(k_low, i, j) = Z(k_low, i, j);
             end
-            
-            % 替换低频段
-            Z_corrected(1:M_opt-1, i, j) = Z_new_low;
         end
     end
 end
 
-% 7. 修正后的Z转回S（加正则化，修复原代码I未定义的bug）
+fprintf('完成外推和S约束调整\n\n');
+
+% 7. 改进的插值：在对数频率空间进行线性插值
+fprintf('========== 对数频率空间线性插值 ==========\n');
+logf = log10(freq);
+
+for i = 1:Nport
+    for j = 1:Nport
+        if jumpMask(i,j)
+            % 被插值的两个端点：最低频点和平滑段起始点
+            Z_low = squeeze(Z_corrected(1, i, j));
+            Z_ref = squeeze(Z_corrected(M_opt, i, j));
+            
+            % 对数频率
+            logf_low = logf(1);
+            logf_ref = logf(M_opt);
+            
+            % 在对数频率空间中对Z的实部和虚部分别进行线性插值
+            for k = 1:M_opt
+                % 插值权重（在对数频率空间）
+                w = (logf(k) - logf_low) / (logf_ref - logf_low);
+                w = max(0, min(1, w));  % 限制在[0,1]
+                
+                % 线性插值
+                R_interp = (1-w) * real(Z_low) + w * real(Z_ref);
+                X_interp = (1-w) * imag(Z_low) + w * imag(Z_ref);
+                
+                Z_corrected(k, i, j) = R_interp + 1i * X_interp;
+            end
+        end
+    end
+end
+
+fprintf('完成对数频率空间线性插值\n\n');
+
+% 8. 修正后的Z转回S（使用稳定转换）
 S_corrected = zeros(Nf, Nport, Nport);
 for k = 1:Nf
     Zk = squeeze(Z_corrected(k,:,:));
-    % 修复：使用 I_mat 替代未定义的 I，并统一正则化项
-    Sk = (Zk/Z0 - I_mat) / (Zk/Z0 + I_mat + 1e-12*I_mat);
-    S_corrected(k,:,:) = Sk;
+    S_corrected(k,:,:) = Z_to_S_matrix_stable(Zk, Z0, I_mat);
 end
 
-% 8. 强制无源性（SVD缩放）
+% 9. 强制无源性（SVD缩放）
 fprintf('强制无源性...\n');
 S_passive = S_corrected;
 violationCount = 0;
@@ -138,15 +174,13 @@ for k = 1:Nf
 end
 fprintf('修正了 %d 个非无源频点\n', violationCount);
 
-% 9. 输出两个文件
+% 10. 输出两个文件
 % output-1.snp: 仅修正极低频点（第一个频点）
 S_output1 = S;
 for i = 1:Nport
     for j = 1:Nport
         if jumpMask(i,j)
-            Zk_dc = Z_corrected(1,i,j);
-            % 修复转S计算
-            S_output1(1,i,j) = (Zk_dc/Z0 - 1) / (Zk_dc/Z0 + 1);
+            S_output1(1, i, j) = S_low_corrected(1, i, j);
         end
     end
 end
@@ -157,6 +191,123 @@ fprintf('仅极低频修正文件已保存: %s\n', outputFile1);
 writeSnP_simple(outputFile2, freq, S_passive, params);
 fprintf('全低频段修正文件已保存: %s\n', outputFile2);
 
+end
+
+% ======================= 新增核心函数 =======================
+
+function Z = S_to_Z_stable(S, Z0, I_mat)
+    % 数值稳定的S→Z单矩阵变换
+    % Z = Z0 * (I + S) * inv(I - S)
+    denom = I_mat - S;
+    
+    % 计算条件数检测奇异性
+    cond_num = cond(denom);
+    if cond_num > 1e12
+        % 使用正则化
+        denom = denom + 1e-10 * I_mat;
+    end
+    
+    numer = I_mat + S;
+    
+    % 使用更稳定的求解方式而不是显式求逆
+    Z = Z0 * (numer / denom);
+end
+
+function S = Z_to_S_matrix_stable(Z, Z0, I_mat)
+    % 数值稳定的Z→S矩阵变换
+    % S = (Z/Z0 - I) / (Z/Z0 + I)
+    z_norm = Z / Z0;
+    
+    numer = z_norm - I_mat;
+    denom = z_norm + I_mat;
+    
+    % 计算条件数检测奇异性
+    cond_num = cond(denom);
+    if cond_num > 1e12
+        % 使用正则化
+        denom = denom + 1e-10 * I_mat;
+    end
+    
+    S = numer / denom;
+end
+
+function S_elem = Z_to_S_element(Z_elem, Z0)
+    % 单个Z元素→S元素的转换
+    % S = (Z/Z0 - 1) / (Z/Z0 + 1)
+    z_norm = Z_elem / Z0;
+    denom = z_norm + 1;
+    
+    if abs(denom) < 1e-15
+        S_elem = 1.0 + 1e-15i;
+    else
+        S_elem = (z_norm - 1) / denom;
+    end
+end
+
+function [Z_extrap, type] = extrapolate_Z_physical(f_curr, f_ref, Z_ref, Z0)
+    % 基于物理规律的Z外推
+    % 返回外推的Z值和外推类型
+    
+    R_ref = real(Z_ref);
+    X_ref = imag(Z_ref);
+    
+    % 判断元素类型
+    if abs(X_ref) < 1e-9 * (abs(R_dc) + 1e-12)
+        type = 'resistive';
+        R_curr = R_ref;
+        X_curr = 0;
+    elseif X_ref < 0
+        type = 'capacitive';
+        R_curr = R_ref;
+        % 容性：X ∝ 1/f，低频时X更大（负向）
+        X_curr = X_ref * (f_ref / f_curr);
+    else
+        type = 'inductive';
+        R_curr = R_ref;
+        % 感性：X ∝ f，低频时X更小
+        X_curr = X_ref * (f_curr / f_ref);
+    end
+    
+    Z_extrap = R_curr + 1i * X_curr;
+end
+
+function Z_adj = constrained_Z_adjustment(Z_init, S_target, Z0, f_curr, f_ref, extrap_type)
+    % 约束优化：调整Z以使S基本保持不变
+    % 关键约束：最小化 |Z_to_S_element(Z_adj, Z0) - S_target|
+    
+    R_init = real(Z_init);
+    X_init = imag(Z_init);
+    
+    % 使用分析性方法：对于高阻抗，S对Z实部敏感度低
+    % 我们采用迭代校正：主要调整R使得S匹配
+    
+    S_init = Z_to_S_element(Z_init, Z0);
+    S_error = S_init - S_target;
+    
+    % 计算Z对S的导数（近似）
+    dZ_small = 0.1 * (1 + abs(R_init));  % 扰动幅度
+    Z_perturb_R = (R_init + dZ_small) + 1i*X_init;
+    S_perturb_R = Z_to_S_element(Z_perturb_R, Z0);
+    dS_dR = (S_perturb_R - S_init) / dZ_small;
+    
+    % 计算所需的R调整（一阶泰勒）
+    if abs(dS_dR) > 1e-15
+        delta_R = -S_error / dS_dR * 0.5;  % 保守因子0.5防止过度校正
+        R_adj = R_init + delta_R;
+    else
+        R_adj = R_init;
+    end
+    
+    % 虚部保持外推值不变（物理意义强）
+    Z_adj = R_adj + 1i * X_init;
+    
+    % 再次检查S误差
+    S_adj = Z_to_S_element(Z_adj, Z0);
+    S_error_new = abs(S_adj - S_target);
+    
+    if S_error_new > abs(S_error)  % 校正变差，回退
+        Z_adj = Z_init;
+    end
 end
 
 % ======================= 辅助函数 =======================
@@ -339,7 +490,7 @@ function writeSnP_simple(filename, freq, S, params)
     fid = fopen(filename, 'w');
     Nport = size(S,2); Nf = size(S,1);
     fprintf(fid, '# %s %s %s R %.1f\n', params.freq_unit, params.param_type, params.format_type, params.R0);
-    fprintf(fid, '! Z-domain R/X physical extrapolation with passivity enforcement\n');
+    fprintf(fid, '! Z-domain R/X physical extrapolation with S-parameter constraint and passivity enforcement\n');
     fprintf(fid, '! Ports: %d, Frequencies: %d\n', Nport, Nf);
     outScale = 1;
     switch upper(params.freq_unit)
